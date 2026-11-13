@@ -1,0 +1,609 @@
+# Build a Blender release package for Windows x64 with the Cycles CUDA and
+# OptiX GPU backends enabled.
+#
+# Notes on the environment:
+#
+# * The pre-compiled libraries live in the `lib/windows_x64` submodule and are
+#   fetched with Git LFS (~7 GB). That download, the source checkout, the CUDA
+#   toolkit and the OptiX headers are fetched in parallel, see the "Install
+#   toolchain and fetch sources" step.
+# * The CUDA Toolkit is *not* part of the runner image, so it is installed here
+#   from NVIDIA's public installer. `build_files/build_environment/windows/
+#   vmprep.cmd.txt` uses the same version for this branch.
+# * OptiX only needs its header files at build time, the OptiX runtime ships
+#   with the NVIDIA display driver. NVIDIA publishes exactly those headers in
+#   the public https://github.com/NVIDIA/optix-dev repository, which is used
+#   here instead of the login gated full SDK download.
+# * Cycles is built for the RTX 50 series only (`sm_120`, compute capability
+#   12.0), which keeps the number of `kernel.cu` compilations down. The CUDA
+#   backend then needs a 50 series card, but the OptiX backend does not: the
+#   OptiX kernels are a single `compute_50` PTX that the driver compiles for
+#   whatever GPU is present (see intern/cycles/kernel/device/optix/
+#   CMakeLists.txt), so other RTX cards still render through OptiX. Widen the
+#   `cuda_architectures` input to cover the CUDA backend on more cards.
+# * The configuration is `build_files/cmake/config/blender_release_ci.cmake`,
+#   which is the regular release configuration minus the Cycles HIP (AMD) and
+#   oneAPI (Intel) backends, those would need the ROCm/HIP SDK and the Intel
+#   oneAPI compilers installed.
+# * The sources, the libraries and the build tree are placed on C:, the system
+#   drive, which has ~80 GB free. The runner's workspace drive has more room,
+#   but its size differs between runner generations, the system drive does not.
+# * sccache uses the GitHub Actions cache as its storage. That cache expires
+#   after 7 days without access, which is why this workflow also runs on a
+#   schedule: the scheduled builds keep the cache (and the artifact) warm.
+#
+# A full build takes roughly 2-4 hours on a 4 core runner and peaks at ~40 GB
+# of disk usage. A build that is fully served from the sccache cache is much
+# faster, but the CUDA/OptiX kernel compilation and the linking are not cached.
+
+name: Windows x64 Release (CUDA + OptiX)
+
+# Note: all inputs are strings on purpose. Boolean inputs are empty for the
+# `push` trigger, and GitHub's expression evaluator coerces an empty string to
+# `false`, which would silently skip steps.
+on:
+  workflow_dispatch:
+    inputs:
+      cuda_version:
+        description: CUDA Toolkit version to install.
+        type: string
+        default: "12.8.0"
+      cuda_installer_url:
+        description: URL of the CUDA Toolkit Windows installer.
+        type: string
+        default: https://developer.download.nvidia.com/compute/cuda/12.8.0/local_installers/cuda_12.8.0_571.96_windows.exe
+      optix_version:
+        description: OptiX headers version (tag of the NVIDIA/optix-dev repository).
+        type: string
+        default: "8.0.0"
+      enable_optix:
+        description: Build Cycles with OptiX support ("true" or "false").
+        type: string
+        default: "true"
+      cuda_architectures:
+        description: Cycles CUDA architectures to compile, semicolon separated. "sm_120" is the RTX 50 series.
+        type: string
+        default: "sm_120"
+      cuda_build_serial:
+        description: Compile the CUDA kernels one after another, lower RAM usage ("true" or "false").
+        type: string
+        default: "true"
+      use_sccache:
+        description: Use sccache, backed by the GitHub Actions cache, to speed up repeated builds ("true" or "false").
+        type: string
+        default: "true"
+      create_release:
+        description: Attach the archive to a GitHub release.
+        type: string
+        default: "false"
+  push:
+    tags: ["v*"]
+  # Twice a week: the GitHub Actions cache is deleted after 7 days without
+  # access, so a weekly run is too close to that limit whenever a scheduled run
+  # gets delayed. The time is deliberately not on the hour, scheduled runs are
+  # queued more reliably then.
+  #
+  # Note that GitHub disables scheduled workflows after 60 days without
+  # repository activity. Pushing any commit (or re-enabling it in the Actions
+  # tab) turns the schedule back on.
+  schedule:
+    - cron: "17 3 * * 1,4"
+
+# Building is expensive, never run two of these for the same ref at once.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  # Short, space free paths. The system drive of the runner has around 80 GB
+  # free, and a build peaks at roughly 40 GB, so no disk cleanup is needed.
+  SRC_DIR: C:\blender\src
+  BUILD_DIR: C:\blender\build
+  OPTIX_DIR: C:\blender\optix
+  # Staging place for the libraries clone, which is moved into the source tree
+  # after the parallel jobs have finished. Must be on C: with the source tree,
+  # otherwise the move would copy 7 GB instead of renaming a directory.
+  LIB_STAGE: C:\blender\libstage
+  # Store the sccache objects in the GitHub Actions cache instead of a local
+  # directory, which would be thrown away with the runner.
+  SCCACHE_GHA_ENABLED: "true"
+
+jobs:
+  build:
+    name: Windows x64 Release
+    runs-on: windows-2022
+    timeout-minutes: 355
+    steps:
+      - name: Report disk space
+        shell: pwsh
+        run: |
+          Get-PSDrive -PSProvider FileSystem |
+            Select-Object Name, @{ n = 'FreeGB'; e = { [math]::Round($_.Free / 1GB, 1) } }
+
+      # Everything the build needs from outside the repository is fetched here:
+      # the CUDA Toolkit, the OptiX headers, the sources and the pre-compiled
+      # libraries. GitHub Actions runs steps strictly one after another, but
+      # these four downloads are independent of each other, so they are started
+      # as parallel PowerShell jobs. Sequentially they take about 15 minutes, in
+      # parallel it is the run time of the slowest one, around 8.
+      #
+      # The variables that the later steps need (`CUDA_PATH`, `OPTIX_ROOT_DIR`,
+      # `PATH`) are written below, once every job has finished, so that the jobs
+      # never write to `GITHUB_ENV` at the same time.
+      - name: Install toolchain and fetch sources
+        shell: pwsh
+        env:
+          CUDA_VERSION: ${{ inputs.cuda_version || '12.8.0' }}
+          CUDA_INSTALLER_URL: ${{ inputs.cuda_installer_url || 'https://developer.download.nvidia.com/compute/cuda/12.8.0/local_installers/cuda_12.8.0_571.96_windows.exe' }}
+          OPTIX_VERSION: ${{ inputs.optix_version || '8.0.0' }}
+          ENABLE_OPTIX: ${{ inputs.enable_optix || 'true' }}
+          SRC_REPO: ${{ github.repository }}
+          SRC_REF: ${{ github.ref_name }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Native tools write progress to stderr, which must not be treated as
+          # a terminating error.
+          $PSNativeCommandUseErrorActionPreference = $false
+
+          # The CUDA Toolkit is not part of the runner image, so it is installed
+          # from NVIDIA's public installer. `build_files/build_environment/
+          # windows/vmprep.cmd.txt` uses the same version for this branch.
+          $cuda = {
+            $ErrorActionPreference = 'Stop'
+            $PSNativeCommandUseErrorActionPreference = $false
+
+            $short = ($env:CUDA_VERSION -split '\.')[0..1] -join '.'
+            $cudaRoot = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v$short"
+
+            if (Test-Path "$cudaRoot\bin\nvcc.exe") {
+              Write-Host "CUDA $short is already installed in $cudaRoot"
+            }
+            else {
+              $installer = "$env:RUNNER_TEMP\cuda_installer.exe"
+              Write-Host "Downloading $env:CUDA_INSTALLER_URL"
+              curl.exe -sSL --retry 3 -o $installer $env:CUDA_INSTALLER_URL
+              if ($LASTEXITCODE -ne 0) {
+                throw "Downloading the CUDA installer failed with exit code $LASTEXITCODE."
+              }
+              if (-not (Test-Path $installer)) { throw 'CUDA installer download failed.' }
+
+              # Only install the subpackages the build needs. Naming subpackages
+              # explicitly leaves out `Display.Driver`, which is a few hundred
+              # megabytes and cannot install on a runner without a GPU. Cycles
+              # does not use cuBLAS, cuRAND, NVRTC or Thrust, so the CUDA compiler
+              # and the runtime libraries are all that is required.
+              # The syntax is documented in the "Possible Subpackage Names"
+              # table of the CUDA installation guide for Microsoft Windows,
+              # `-n` suppresses the automatic reboot.
+              $components = @("nvcc_$short", "cudart_$short")
+              Write-Host "Installing the CUDA subpackages $($components -join ', ')."
+              $process = Start-Process -FilePath $installer `
+                -ArgumentList (@('-s', '-n') + $components) -Wait -PassThru
+              if ($process.ExitCode -ne 0) {
+                Write-Warning "CUDA installer exited with code $($process.ExitCode)."
+              }
+
+              # Fall back to the complete toolkit when the selective install did
+              # not provide what the build needs. The display driver component of
+              # that install fails on a runner without a GPU, which is why the
+              # result is verified instead of trusting the exit code.
+              # `find_package(CUDA)` looks for `cuda.h`, the kernels include
+              # `cuda_runtime.h`, either one is enough to know the headers are in.
+              $hasHeaders = (Test-Path "$cudaRoot\include\cuda.h") -or
+                (Test-Path "$cudaRoot\include\cuda_runtime.h")
+              if (-not (Test-Path "$cudaRoot\bin\nvcc.exe") -or -not $hasHeaders) {
+                Write-Warning 'The selective CUDA install is incomplete, installing the whole toolkit.'
+                $process = Start-Process -FilePath $installer -ArgumentList '-s', '-n' -Wait -PassThru
+                if ($process.ExitCode -ne 0) {
+                  Write-Warning "CUDA installer exited with code $($process.ExitCode)."
+                }
+              }
+              Remove-Item -Force $installer -ErrorAction SilentlyContinue
+            }
+
+            if (-not (Test-Path "$cudaRoot\bin\nvcc.exe")) {
+              throw "The CUDA Toolkit was not installed to $cudaRoot."
+            }
+            & "$cudaRoot\bin\nvcc.exe" --version
+          }
+
+          # OptiX only needs its header files at build time, the OptiX runtime
+          # ships with the NVIDIA display driver. NVIDIA publishes exactly those
+          # headers in the public https://github.com/NVIDIA/optix-dev repository,
+          # which is used here instead of the login gated full SDK download.
+          $optix = {
+            $ErrorActionPreference = 'Stop'
+            $PSNativeCommandUseErrorActionPreference = $false
+            if ($env:ENABLE_OPTIX -eq 'false') {
+              Write-Host 'OptiX is disabled, skipping.'
+              return
+            }
+
+            $archive = "$env:RUNNER_TEMP\optix-dev.tar.gz"
+            $url = "https://github.com/NVIDIA/optix-dev/archive/refs/tags/v$env:OPTIX_VERSION.tar.gz"
+            Write-Host "Downloading $url"
+            curl.exe -sSL --retry 3 -o $archive $url
+
+            New-Item -ItemType Directory -Force -Path $env:OPTIX_DIR | Out-Null
+            # The tarball has a single top level directory, strip it so that
+            # `<OPTIX_DIR>\include\optix.h` is what `FindOptiX.cmake` looks for.
+            tar.exe -xzf $archive -C $env:OPTIX_DIR --strip-components=1
+            if ($LASTEXITCODE -ne 0) {
+              throw "Extracting the OptiX headers failed with exit code $LASTEXITCODE."
+            }
+            Remove-Item -Force $archive -ErrorAction SilentlyContinue
+
+            $header = Join-Path $env:OPTIX_DIR 'include\optix.h'
+            if (-not (Test-Path $header)) { throw "OptiX headers not found in $env:OPTIX_DIR." }
+            Write-Host "OptiX headers installed in $env:OPTIX_DIR"
+            Get-Content $header | Select-String 'OPTIX_VERSION'
+          }
+
+          $sources = {
+            $ErrorActionPreference = 'Stop'
+            $PSNativeCommandUseErrorActionPreference = $false
+
+            # Blender stores a few hundred megabytes of data files (icons, color
+            # management, startup files, test scenes) in Git LFS. Those objects
+            # are not pushed to the fork to stay within the GitHub LFS quota, so
+            # the smudge filter is disabled while cloning and the objects are
+            # fetched from the upstream mirror below.
+            $env:GIT_LFS_SKIP_SMUDGE = '1'
+            git clone --depth 1 --branch $env:SRC_REF `
+              "https://github.com/$($env:SRC_REPO).git" $env:SRC_DIR
+            if ($LASTEXITCODE -ne 0) { throw 'Cloning the sources failed.' }
+            git -C $env:SRC_DIR log --oneline -1
+
+            git -C $env:SRC_DIR remote add blender-upstream `
+              https://projects.blender.org/blender/blender.git
+            Remove-Item Env:\GIT_LFS_SKIP_SMUDGE
+
+            git -C $env:SRC_DIR lfs fetch blender-upstream HEAD
+            if ($LASTEXITCODE -ne 0) { throw 'Fetching the LFS objects from upstream failed.' }
+            git -C $env:SRC_DIR lfs checkout
+            if ($LASTEXITCODE -ne 0) { throw 'Checking out the LFS objects failed.' }
+
+            # A pointer file is a couple of hundred bytes, real content is larger.
+            $probe = "$env:SRC_DIR\assets\brushes\essentials_brushes-curve_sculpt.blend"
+            if (-not (Test-Path $probe) -or (Get-Item $probe).Length -lt 100KB) {
+              throw "The LFS content is missing, $probe is still a pointer file."
+            }
+          }
+
+          $libraries = {
+            $ErrorActionPreference = 'Stop'
+            $PSNativeCommandUseErrorActionPreference = $false
+
+            # The libraries revision is pinned by the superproject, so this job
+            # needs a revision from the source repository. Reading it from a
+            # `--filter=blob:none --no-checkout` clone of the same commit costs a
+            # few seconds and a couple of megabytes, and keeps this job
+            # independent of the full source checkout that runs at the same time.
+            $env:GIT_LFS_SKIP_SMUDGE = '1'
+            $refDir = "$env:RUNNER_TEMP\refs"
+            Remove-Item -Recurse -Force $refDir -ErrorAction SilentlyContinue
+            git clone --depth 1 --filter=blob:none --no-checkout `
+              --branch $env:SRC_REF "https://github.com/$($env:SRC_REPO).git" $refDir
+            if ($LASTEXITCODE -ne 0) {
+              throw 'Cloning the source repository to read the libraries revision failed.'
+            }
+
+            $entry = ((git -C $refDir ls-tree HEAD -- lib/windows_x64) -join '').Trim()
+            Write-Host "Submodule entry: $entry"
+            if ($entry -notmatch '^160000 commit ([0-9a-f]{40})') {
+              Write-Host 'Diagnostics, entries below lib/:'
+              git -C $refDir ls-tree HEAD lib/
+              throw 'The lib/windows_x64 submodule is not recorded in this commit.'
+            }
+            $sha = $Matches[1]
+            Write-Host "Libraries revision: $sha"
+            Remove-Item -Recurse -Force $refDir
+
+            # `git submodule` is deliberately not used here. Upstream marks the
+            # libraries with `update = none`, which makes the update depend on
+            # the submodule registration state in `.git/config`. Cloning the
+            # pinned revision directly is equivalent, but deterministic.
+            #
+            # The clone is made next to the sources instead of into them: the
+            # source checkout runs at the same time and needs its target
+            # directory to be empty. Both are on C:, so the parent step moves
+            # the clone into place with a rename instead of a 7 GB copy.
+            git clone --no-checkout 'https://projects.blender.org/blender/lib-windows_x64.git' `
+              $env:LIB_STAGE
+            if ($LASTEXITCODE -ne 0) { throw 'Cloning the libraries repository failed.' }
+
+            git -C $env:LIB_STAGE checkout --detach $sha
+            if ($LASTEXITCODE -ne 0) { throw "Checking out libraries revision $sha failed." }
+
+            Remove-Item Env:\GIT_LFS_SKIP_SMUDGE
+            git -C $env:LIB_STAGE lfs pull
+            if ($LASTEXITCODE -ne 0) { throw 'Downloading the libraries through Git LFS failed.' }
+
+            $python = Get-ChildItem "$env:LIB_STAGE\python" -Directory -ErrorAction SilentlyContinue |
+              Where-Object { Test-Path "$($_.FullName)\bin\python.exe" } |
+              Select-Object -First 1
+            if (-not $python) { throw 'The pre-compiled libraries are incomplete, no Python found.' }
+            Write-Host "Libraries ready, using Python $($python.Name)."
+
+            # The LFS cache is a second copy of everything that was just checked
+            # out (~6 GB), and the build never uses it.
+            Remove-Item -Recurse -Force "$env:LIB_STAGE\.git\lfs" -ErrorAction SilentlyContinue
+          }
+
+          $jobs = @(
+            (Start-Job -Name 'cuda' -ScriptBlock $cuda)
+            (Start-Job -Name 'optix' -ScriptBlock $optix)
+            (Start-Job -Name 'sources' -ScriptBlock $sources)
+            (Start-Job -Name 'libraries' -ScriptBlock $libraries)
+          )
+          Write-Host "Started $($jobs.Count) parallel jobs: $((($jobs | ForEach-Object Name) -join ', '))"
+
+          # Receive the output of the jobs while they run, so that the log shows
+          # progress instead of one block per job at the end.
+          #
+          # `Receive-Job` reports a job's errors through `Write-Error`, which
+          # `$ErrorActionPreference = 'Stop'` would turn into a terminating error
+          # while the other jobs are still running. The preference is lowered for
+          # the loop, `2>&1` keeps the errors out of the error stream, and an
+          # `ErrorRecord` is reduced to its message so that native stderr (git
+          # progress, installer output) does not show up as a formatted error.
+          $ErrorActionPreference = 'Continue'
+          $pending = @($jobs)
+          $failed = @()
+          $deadline = (Get-Date).AddMinutes(90)
+          while ($pending.Count -gt 0) {
+            if ((Get-Date) -gt $deadline) {
+              $pending | Stop-Job -ErrorAction SilentlyContinue
+              $jobs | Remove-Job -Force -ErrorAction SilentlyContinue
+              throw 'The preparation jobs did not finish within 90 minutes.'
+            }
+            foreach ($job in @($pending)) {
+              Receive-Job -Job $job 2>&1 |
+                ForEach-Object {
+                  if ($_ -is [System.Management.Automation.ErrorRecord]) { "$_" } else { $_ }
+                } |
+                Out-Host
+              if ($job.State -in @('Completed', 'Failed', 'Stopped')) {
+                if ($job.State -ne 'Completed') { $failed += $job.Name }
+                $pending = @($pending | Where-Object Id -ne $job.Id)
+              }
+            }
+            if ($pending.Count -gt 0) { Start-Sleep -Seconds 3 }
+          }
+          $jobs | Remove-Job
+          $ErrorActionPreference = 'Stop'
+
+          if ($failed.Count -gt 0) {
+            throw "These preparation jobs failed: $($failed -join ', ')."
+          }
+
+          # Move the libraries to the place the build expects them at. Same
+          # volume, so this is a rename.
+          $libTarget = "$env:SRC_DIR\lib\windows_x64"
+          New-Item -ItemType Directory -Force -Path (Split-Path $libTarget -Parent) | Out-Null
+          Remove-Item -Recurse -Force $libTarget -ErrorAction SilentlyContinue
+          Move-Item -LiteralPath $env:LIB_STAGE -Destination $libTarget
+          if (-not (Test-Path $libTarget\python)) {
+            throw 'The pre-compiled libraries were not moved into the source tree.'
+          }
+
+          # `find_package(CUDA)` reads these, and later steps need them as well.
+          $short = ($env:CUDA_VERSION -split '\.')[0..1] -join '.'
+          $cudaRoot = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v$short"
+          "CUDA_PATH=$cudaRoot" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "CUDA_HOME=$cudaRoot" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "CUDA_TOOLKIT_ROOT_DIR=$cudaRoot" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "CUDA_NVCC_EXECUTABLE=$cudaRoot\bin\nvcc.exe" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "$cudaRoot\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+
+          if ($env:ENABLE_OPTIX -ne 'false') {
+            "OPTIX_ROOT_DIR=$env:OPTIX_DIR" | Out-File -FilePath $env:GITHUB_ENV -Append
+          }
+
+          Get-PSDrive -PSProvider FileSystem |
+            Select-Object Name, @{ n = 'FreeGB'; e = { [math]::Round($_.Free / 1GB, 1) } }
+
+      - name: Set up MSVC environment
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Native tools write progress to stderr, which must not be treated as
+          # a terminating error.
+          $PSNativeCommandUseErrorActionPreference = $false
+
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsPath = & $vswhere -latest -products * `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+            -property installationPath
+          if (-not $vsPath) { throw 'Visual Studio with the C++ toolset was not found.' }
+
+          # Enter the developer shell and forward every environment variable it
+          # changes to the steps below, since each step runs in a fresh shell.
+          $before = @{}
+          foreach ($item in Get-ChildItem env:) { $before[$item.Name] = $item.Value }
+
+          & "$vsPath\Common7\Tools\Launch-VsDevShell.ps1" `
+            -Arch amd64 -HostArch amd64 -SkipAutomaticLocation | Out-Null
+
+          foreach ($item in Get-ChildItem env:) {
+            if ($before[$item.Name] -ne $item.Value) {
+              "$($item.Name)=$($item.Value)" | Out-File -FilePath $env:GITHUB_ENV -Append
+            }
+          }
+
+          Write-Host "Visual Studio: $vsPath"
+          & cl.exe 2>&1 | Select-Object -First 1
+
+      # Installs sccache and wires it up to the GitHub Actions cache. The action
+      # also prints the cache statistics in a post step. It is not fatal when
+      # this fails, the configure step below only enables sccache when the
+      # binary is actually available.
+      - name: Set up sccache
+        if: ${{ inputs.use_sccache != 'false' }}
+        id: sccache
+        continue-on-error: true
+        uses: Mozilla-Actions/sccache-action@v0.0.11
+        with:
+          # Must be at least v0.11.0 for the GitHub Actions cache backend.
+          version: "v0.18.0"
+
+      - name: Configure
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Native tools write progress to stderr, which must not be treated as
+          # a terminating error.
+          $PSNativeCommandUseErrorActionPreference = $false
+
+          $arguments = @(
+            '-G', 'Ninja',
+            '-S', $env:SRC_DIR,
+            '-B', $env:BUILD_DIR,
+            '-C', "$env:SRC_DIR\build_files\cmake\config\blender_release_ci.cmake",
+            '-DCMAKE_BUILD_TYPE=Release',
+            "-DCYCLES_CUDA_BINARIES_ARCH=${{ inputs.cuda_architectures || 'sm_120' }}",
+            "-DWITH_CYCLES_CUDA_BUILD_SERIAL=$(if ('${{ inputs.cuda_build_serial }}' -eq 'false') { 'OFF' } else { 'ON' })",
+            "-DWITH_CYCLES_DEVICE_OPTIX=$(if ('${{ inputs.enable_optix }}' -eq 'false') { 'OFF' } else { 'ON' })"
+          )
+
+          if ($env:OPTIX_ROOT_DIR) {
+            $arguments += "-DOPTIX_ROOT_DIR=$env:OPTIX_ROOT_DIR"
+          }
+
+          # Only enable it when the binary is really there, otherwise the build
+          # would fail trying to launch a missing compiler wrapper.
+          if (Get-Command sccache -ErrorAction SilentlyContinue) {
+            $arguments += '-DWITH_WINDOWS_SCCACHE=ON'
+          }
+          else {
+            Write-Warning 'sccache is not available, building without it.'
+          }
+
+          Write-Host "cmake $($arguments -join ' ')"
+          cmake @arguments
+
+      - name: Build
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Native tools write progress to stderr, which must not be treated as
+          # a terminating error.
+          $PSNativeCommandUseErrorActionPreference = $false
+
+          $jobs = [Environment]::ProcessorCount
+          Write-Host "Building with $jobs parallel jobs."
+          ninja -C $env:BUILD_DIR -j $jobs install
+          if ($LASTEXITCODE -ne 0) { throw "The build failed with exit code $LASTEXITCODE." }
+
+          # The cache statistics are printed by the sccache action in a post step.
+          if (Get-Command sccache -ErrorAction SilentlyContinue) { sccache --show-stats }
+
+          if (-not (Test-Path "$env:BUILD_DIR\bin\blender.exe")) {
+            throw 'The build did not produce blender.exe.'
+          }
+
+      - name: Package
+        id: package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Native tools write progress to stderr, which must not be treated as
+          # a terminating error.
+          $PSNativeCommandUseErrorActionPreference = $false
+
+          # The version is stored as `502` plus a separate patch number.
+          $header = Get-Content "$env:SRC_DIR\source\blender\blenkernel\BKE_blender_version.h" -Raw
+          $main = [int]([regex]::Match($header, 'BLENDER_VERSION\s+(\d+)').Groups[1].Value)
+          $patch = [int]([regex]::Match($header, 'BLENDER_VERSION_PATCH\s+(\d+)').Groups[1].Value)
+          $version = "$([math]::Floor($main / 100)).$($main % 100).$patch"
+
+          $folder = "blender-$version-windows-x64"
+          $stageRoot = "$env:RUNNER_TEMP\stage"
+          $stage = "$stageRoot\$folder"
+          Remove-Item -Recurse -Force $stageRoot -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item -Recurse -Force "$env:BUILD_DIR\bin\*" $stage
+
+          $size = (Get-ChildItem $stage -Recurse -File | Measure-Object Length -Sum).Sum
+          Write-Host "Staged $folder ($([math]::Round($size / 1MB, 1)) MB)"
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "stage_root=$stageRoot" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      # The build is uploaded as a directory, never as a zip. GitHub stores
+      # artifacts as individual files and turns every download into exactly one
+      # zip, so uploading a zip yields a zip inside a zip. The wildcard matters:
+      # the action uses the part of the path before the wildcard as the root of
+      # the artifact, so `stage/*` keeps the `blender-<version>-windows-x64`
+      # folder while naming the folder itself would flatten the archive.
+      - name: Upload build
+        uses: actions/upload-artifact@v4
+        with:
+          name: blender-${{ steps.package.outputs.version }}-windows-x64
+          path: ${{ steps.package.outputs.stage_root }}/*
+          # Retrying the job would otherwise collide with its own artifact.
+          overwrite: true
+          if-no-files-found: error
+          retention-days: 14
+
+      # Release assets are plain files that are not wrapped in anything, so the
+      # archive is only built when it is actually attached to a release.
+      - name: Create release archive
+        id: archive
+        if: ${{ github.ref_type == 'tag' || inputs.create_release == 'true' }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+
+          $stageRoot = "${{ steps.package.outputs.stage_root }}"
+          $folder = Get-ChildItem $stageRoot -Directory | Select-Object -First 1
+          $archive = "$env:RUNNER_TEMP\$($folder.Name).zip"
+          Remove-Item -Force $archive -ErrorAction SilentlyContinue
+
+          # Both tools archive relative to the current directory, which keeps
+          # the leading `blender-<version>-windows-x64` folder in the archive.
+          Push-Location $stageRoot
+          try {
+            if (Test-Path "$env:ProgramFiles\7-Zip\7z.exe") {
+              & "$env:ProgramFiles\7-Zip\7z.exe" a -tzip -mx=5 -bso0 -bsp0 $archive $folder.Name
+            }
+            else {
+              # bsdtar, which ships with Windows, writes zip archives as well.
+              tar.exe -a -cf $archive $folder.Name
+            }
+            if ($LASTEXITCODE -ne 0) { throw "Archiving failed with exit code $LASTEXITCODE." }
+          }
+          finally {
+            Pop-Location
+          }
+
+          if (-not (Test-Path $archive)) { throw 'Packaging failed.' }
+          Write-Host "Created $($folder.Name).zip ($([math]::Round((Get-Item $archive).Length / 1MB, 1)) MB)"
+          "archive=$archive" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Attach archive to release
+        if: ${{ github.ref_type == 'tag' || inputs.create_release == 'true' }}
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+
+          $tag = "${{ github.ref_name }}"
+          $archive = "${{ steps.archive.outputs.archive }}"
+
+          # Re-running a failed job for the same tag must not fail here.
+          gh release view $tag 2>$null | Out-Null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag $archive --clobber
+          }
+          else {
+            gh release create $tag $archive `
+              --title "Blender ${{ steps.package.outputs.version }} (Windows x64, CUDA + OptiX)" `
+              --notes "Self built Blender release for Windows x64 with the Cycles CUDA and OptiX backends enabled."
+          }
+          if ($LASTEXITCODE -ne 0) { throw 'Publishing the release failed.' }
